@@ -2,6 +2,10 @@ import logging
 import os
 import re
 import tempfile
+import json
+import zipfile
+import urllib.request
+import subprocess
 from datetime import datetime, timedelta, timezone
 import sqlite3
 import asyncio
@@ -18,7 +22,12 @@ BTN_LIST = "📋 Мои напоминания"
 BTN_DELETE = "🗑 Удалить напоминание"
 
 TASKS = {}
-WHISPER_MODEL = None
+VOSK_MODEL = None
+VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "vosk-model-small-ru-0.22")
+VOSK_MODEL_URL = os.getenv(
+    "VOSK_MODEL_URL",
+    "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
+)
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -138,12 +147,23 @@ def parse_time_from_text(text: str):
 
     return None, "❌ Не смог распознать время. Скажи, например: напомни в 15:00 купить хлеб"
 
-def get_whisper_model():
-    global WHISPER_MODEL
-    if WHISPER_MODEL is None:
-        import whisper
-        WHISPER_MODEL = whisper.load_model("base")
-    return WHISPER_MODEL
+def ensure_vosk_model():
+    if os.path.isdir(VOSK_MODEL_PATH):
+        return VOSK_MODEL_PATH
+    zip_path = VOSK_MODEL_PATH + ".zip"
+    if not os.path.isfile(zip_path):
+        urllib.request.urlretrieve(VOSK_MODEL_URL, zip_path)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(".")
+    return VOSK_MODEL_PATH
+
+def get_vosk_model():
+    global VOSK_MODEL
+    if VOSK_MODEL is None:
+        from vosk import Model
+        model_path = ensure_vosk_model()
+        VOSK_MODEL = Model(model_path)
+    return VOSK_MODEL
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -198,16 +218,29 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         file = await context.bot.get_file(voice.file_id)
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp_path = tmp.name
-        await file.download_to_drive(tmp_path)
+            ogg_path = tmp.name
+        await file.download_to_drive(ogg_path)
 
-        model = get_whisper_model()
-        result = await asyncio.to_thread(
-            model.transcribe,
-            tmp_path,
-            language="ru",
-            fp16=False,
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+            wav_path = tmp_wav.name
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", "-f", "wav", wav_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+
+        model = get_vosk_model()
+        from vosk import KaldiRecognizer
+        rec = KaldiRecognizer(model, 16000)
+        with open(wav_path, "rb") as f:
+            while True:
+                data = f.read(4000)
+                if len(data) == 0:
+                    break
+                rec.AcceptWaveform(data)
+        result = json.loads(rec.FinalResult())
         text = (result.get("text") or "").strip()
         if not text:
             await update.message.reply_text("❌ Не удалось распознать голос. Попробуй еще раз.", reply_markup=keyboard())
@@ -228,6 +261,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.exception("Ошибка обработки голосового сообщения: %s", e)
         await update.message.reply_text("❌ Ошибка при обработке голосового.", reply_markup=keyboard())
+    finally:
+        try:
+            if 'ogg_path' in locals() and os.path.exists(ogg_path):
+                os.remove(ogg_path)
+            if 'wav_path' in locals() and os.path.exists(wav_path):
+                os.remove(wav_path)
+        except Exception:
+            pass
 
 async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
