@@ -13,7 +13,6 @@ import psycopg2.extras
 import asyncio
 from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +23,22 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 BTN_LIST = "📋 Мои напоминания"
 BTN_DELETE = "🗑 Удалить напоминание"
+BTN_HELP = "❓ Как писать"
+
+REPEAT_INTERVAL_SEC = 120
+MAX_ATTEMPTS = 3
+
+HELP_TEXT = (
+    "Как писать:\n"
+    "В 13 купить хлеб\n"
+    "В 13:30 купить хлеб\n"
+    "В 13 30 купить хлеб\n"
+    "Напомни в 15:00 купить хлеб\n"
+    "Напомни через 15 минут выключить плиту\n"
+    "\n"
+    "Можно голосом.\n"
+    "После напоминания нажми «Прочитал», иначе бот повторит."
+)
 
 TASKS = {}
 VOSK_MODEL = None
@@ -49,17 +64,29 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT NOT NULL,
                     text TEXT NOT NULL,
-                    run_at BIGINT NOT NULL
+                    run_at BIGINT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+                    awaiting_confirm BOOLEAN NOT NULL DEFAULT FALSE
                 )
                 """
             )
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS status_messages (
+                CREATE TABLE IF NOT EXISTS chat_settings (
                     chat_id BIGINT PRIMARY KEY,
-                    message_id BIGINT NOT NULL
+                    intro_sent BOOLEAN NOT NULL DEFAULT FALSE
                 )
                 """
+            )
+            cur.execute(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0"
+            )
+            cur.execute(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS acknowledged BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            cur.execute(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS awaiting_confirm BOOLEAN NOT NULL DEFAULT FALSE"
             )
         else:
             cur.execute(
@@ -68,18 +95,36 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
                     text TEXT NOT NULL,
-                    run_at INTEGER NOT NULL
+                    run_at INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
+                    awaiting_confirm INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS status_messages (
+                CREATE TABLE IF NOT EXISTS chat_settings (
                     chat_id INTEGER PRIMARY KEY,
-                    message_id INTEGER NOT NULL
+                    intro_sent INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(reminders)").fetchall()
+            }
+            if "attempts" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE reminders ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "acknowledged" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE reminders ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0"
+                )
+            if "awaiting_confirm" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE reminders ADD COLUMN awaiting_confirm INTEGER NOT NULL DEFAULT 0"
+                )
         conn.commit()
     finally:
         conn.close()
@@ -123,56 +168,138 @@ def list_reminders(chat_id: int, limit: int = 10):
         if DATABASE_URL:
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, text, run_at FROM reminders WHERE chat_id = %s AND run_at >= %s ORDER BY run_at ASC LIMIT %s",
+                """
+                SELECT id, text, run_at
+                FROM reminders
+                WHERE chat_id = %s AND acknowledged = FALSE AND (run_at >= %s OR awaiting_confirm = TRUE)
+                ORDER BY run_at ASC
+                LIMIT %s
+                """,
                 (chat_id, now_ts, limit),
             )
             return cur.fetchall()
         else:
             cur = conn.execute(
-                "SELECT id, text, run_at FROM reminders WHERE chat_id = ? AND run_at >= ? ORDER BY run_at ASC LIMIT ?",
+                """
+                SELECT id, text, run_at
+                FROM reminders
+                WHERE chat_id = ? AND acknowledged = 0 AND (run_at >= ? OR awaiting_confirm = 1)
+                ORDER BY run_at ASC
+                LIMIT ?
+                """,
                 (chat_id, now_ts, limit),
             )
             return cur.fetchall()
     finally:
         conn.close()
 
-def get_status_message_id(chat_id: int):
+def is_intro_sent(chat_id: int) -> bool:
     conn = get_conn()
     try:
         if DATABASE_URL:
             cur = conn.cursor()
             cur.execute(
-                "SELECT message_id FROM status_messages WHERE chat_id = %s",
+                "SELECT intro_sent FROM chat_settings WHERE chat_id = %s",
                 (chat_id,),
             )
             row = cur.fetchone()
         else:
             cur = conn.execute(
-                "SELECT message_id FROM status_messages WHERE chat_id = ?",
+                "SELECT intro_sent FROM chat_settings WHERE chat_id = ?",
                 (chat_id,),
             )
             row = cur.fetchone()
-        return row[0] if row else None
+        return bool(row[0]) if row else False
     finally:
         conn.close()
 
-def set_status_message_id(chat_id: int, message_id: int):
+def set_intro_sent(chat_id: int):
     conn = get_conn()
     try:
         if DATABASE_URL:
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO status_messages (chat_id, message_id)
-                VALUES (%s, %s)
-                ON CONFLICT (chat_id) DO UPDATE SET message_id = EXCLUDED.message_id
+                INSERT INTO chat_settings (chat_id, intro_sent)
+                VALUES (%s, TRUE)
+                ON CONFLICT (chat_id) DO UPDATE SET intro_sent = TRUE
                 """,
-                (chat_id, message_id),
+                (chat_id,),
             )
         else:
             conn.execute(
-                "INSERT OR REPLACE INTO status_messages (chat_id, message_id) VALUES (?, ?)",
-                (chat_id, message_id),
+                "INSERT OR REPLACE INTO chat_settings (chat_id, intro_sent) VALUES (?, 1)",
+                (chat_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_reminder(reminder_id: int):
+    conn = get_conn()
+    try:
+        if DATABASE_URL:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, chat_id, text, run_at, attempts, acknowledged, awaiting_confirm
+                FROM reminders
+                WHERE id = %s
+                """,
+                (reminder_id,),
+            )
+            return cur.fetchone()
+        cur = conn.execute(
+            """
+            SELECT id, chat_id, text, run_at, attempts, acknowledged, awaiting_confirm
+            FROM reminders
+            WHERE id = ?
+            """,
+            (reminder_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+def update_reminder_state(
+    reminder_id: int,
+    *,
+    run_at: int | None = None,
+    attempts: int | None = None,
+    acknowledged: bool | None = None,
+    awaiting_confirm: bool | None = None,
+):
+    fields = []
+    values = []
+    if run_at is not None:
+        fields.append("run_at")
+        values.append(run_at)
+    if attempts is not None:
+        fields.append("attempts")
+        values.append(attempts)
+    if acknowledged is not None:
+        fields.append("acknowledged")
+        values.append(acknowledged)
+    if awaiting_confirm is not None:
+        fields.append("awaiting_confirm")
+        values.append(awaiting_confirm)
+    if not fields:
+        return
+
+    conn = get_conn()
+    try:
+        if DATABASE_URL:
+            set_parts = [f"{name} = %s" for name in fields]
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE reminders SET {', '.join(set_parts)} WHERE id = %s",
+                (*values, reminder_id),
+            )
+        else:
+            set_parts = [f"{name} = ?" for name in fields]
+            conn.execute(
+                f"UPDATE reminders SET {', '.join(set_parts)} WHERE id = ?",
+                (*values, reminder_id),
             )
         conn.commit()
     finally:
@@ -185,13 +312,21 @@ def load_pending_reminders():
         if DATABASE_URL:
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, chat_id, text, run_at FROM reminders WHERE run_at >= %s",
+                """
+                SELECT id
+                FROM reminders
+                WHERE run_at >= %s AND acknowledged = FALSE AND awaiting_confirm = FALSE
+                """,
                 (now_ts,),
             )
             return cur.fetchall()
         else:
             cur = conn.execute(
-                "SELECT id, chat_id, text, run_at FROM reminders WHERE run_at >= ?",
+                """
+                SELECT id
+                FROM reminders
+                WHERE run_at >= ? AND acknowledged = 0 AND awaiting_confirm = 0
+                """,
                 (now_ts,),
             )
             return cur.fetchall()
@@ -199,99 +334,75 @@ def load_pending_reminders():
         conn.close()
 
 def keyboard():
-    return ReplyKeyboardMarkup([[BTN_LIST, BTN_DELETE]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([[BTN_LIST, BTN_DELETE], [BTN_HELP]], resize_keyboard=True)
 
 def format_run_at(ts: int) -> str:
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MOSCOW_TZ)
     return dt.strftime("%d.%m %H:%M")
 
-def build_status_text(chat_id: int, notice: str | None = None) -> str:
-    lines = [
-        "👋 Привет! Я бот-напоминалка.",
-        "Можно писать текстом или голосом.",
-    ]
-    if notice:
-        lines += ["", notice]
-    lines += [
-        "",
-        "Напиши сообщение в свободной форме, например:",
-        "В 13 купить хлеб",
-        "Напомни в 15:00 купить хлеб",
-        "или: Напомни через 15 минут выключить плиту",
-        "",
-    ]
-    items = list_reminders(chat_id, limit=10)
-    if items:
-        lines.append("Ближайшие напоминания:")
-        for _id, text, run_at in items:
-            lines.append(f"• {format_run_at(run_at)} — {text}")
-    else:
-        lines.append("Сейчас нет активных напоминаний.")
-    return "\n".join(lines)
+def reminder_ack_keyboard(reminder_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Прочитал", callback_data=f"ack:{reminder_id}")]]
+    )
 
-def build_delete_keyboard(chat_id: int):
-    items = list_reminders(chat_id, limit=10)
-    if not items:
-        return None
-    buttons = []
-    for _id, text, run_at in items:
-        label = f"{format_run_at(run_at)} — {text[:30]}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"del:{_id}")])
-    buttons.append([InlineKeyboardButton("Отмена", callback_data="del:cancel")])
-    return InlineKeyboardMarkup(buttons)
+def confirm_keyboard(reminder_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Да", callback_data=f"confirm_yes:{reminder_id}"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"confirm_no:{reminder_id}")
+        ]]
+    )
 
-async def update_status_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-    inline_keyboard: InlineKeyboardMarkup | None = None,
-    include_keyboard: bool = False,
-):
-    chat_id = update.effective_chat.id
-    message_id = get_status_message_id(chat_id)
-    edit_failed = False
-    if message_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=inline_keyboard,
-            )
-            return
-        except (BadRequest, TelegramError) as e:
-            if isinstance(e, BadRequest) and "message is not modified" in str(e).lower():
-                return
-            edit_failed = True
-            logging.warning("Не удалось отредактировать статус-сообщение: %s", e)
-
-    reply_markup = inline_keyboard
-    if reply_markup is None and (include_keyboard or message_id is None or edit_failed):
-        reply_markup = keyboard()
-
-    if update.message:
-        msg = await update.message.reply_text(text, reply_markup=reply_markup)
-    else:
-        msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
-    set_status_message_id(chat_id, msg.message_id)
-
-def schedule_reminder(app: Application, reminder_id: int, chat_id: int, text: str, run_at: int):
-    task = app.create_task(reminder_task(app, reminder_id, chat_id, text, run_at))
+def schedule_reminder(app: Application, reminder_id: int):
+    existing = TASKS.pop(reminder_id, None)
+    if existing:
+        existing.cancel()
+    task = app.create_task(reminder_task(app, reminder_id))
     TASKS[reminder_id] = task
 
-async def reminder_task(app: Application, reminder_id: int, chat_id: int, text: str, run_at: int):
+async def reminder_task(app: Application, reminder_id: int):
     try:
-        delay = run_at - int(datetime.now(timezone.utc).timestamp())
-        if delay > 0:
-            await asyncio.sleep(delay)
-        await app.bot.send_message(chat_id=chat_id, text=f"🔔 Напоминание:\n{text}")
+        while True:
+            reminder = get_reminder(reminder_id)
+            if not reminder:
+                return
+
+            _, chat_id, text, run_at, attempts, acknowledged, awaiting_confirm = reminder
+            if acknowledged:
+                delete_reminder(reminder_id)
+                return
+            if awaiting_confirm:
+                return
+
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            delay = run_at - now_ts
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
+            if attempts >= MAX_ATTEMPTS:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Вы получили напоминание?\n{text}",
+                    reply_markup=confirm_keyboard(reminder_id),
+                )
+                update_reminder_state(reminder_id, awaiting_confirm=True)
+                return
+
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔔 {text}",
+                reply_markup=reminder_ack_keyboard(reminder_id),
+            )
+            attempts += 1
+            next_run = int(datetime.now(timezone.utc).timestamp()) + REPEAT_INTERVAL_SEC
+            update_reminder_state(reminder_id, attempts=attempts, run_at=next_run)
     except asyncio.CancelledError:
         return
     except Exception as e:
         logging.exception("Ошибка при отправке напоминания: %s", e)
     finally:
         TASKS.pop(reminder_id, None)
-        delete_reminder(reminder_id)
 
 def parse_time_from_text(text: str):
     lower = text.lower()
@@ -302,7 +413,7 @@ def parse_time_from_text(text: str):
         hour = int(time_match.group(1))
         minute = int(time_match.group(2))
         if hour > 23 or minute > 59:
-            return None, "❌ Неверное время. Пример: 15:00"
+            return None, "❌ Неверное время."
 
         now = datetime.now(MOSCOW_TZ)
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -328,7 +439,7 @@ def parse_time_from_text(text: str):
         hour = int(time_match_space.group(1))
         minute = int(time_match_space.group(2))
         if hour > 23 or minute > 59:
-            return None, "❌ Неверное время. Пример: 15:00"
+            return None, "❌ Неверное время."
 
         now = datetime.now(MOSCOW_TZ)
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -353,7 +464,7 @@ def parse_time_from_text(text: str):
     if time_match_hour:
         hour = int(time_match_hour.group(1))
         if hour > 23:
-            return None, "❌ Неверное время. Пример: 15:00"
+            return None, "❌ Неверное время."
 
         now = datetime.now(MOSCOW_TZ)
         target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -539,7 +650,7 @@ def parse_time_from_text(text: str):
             reminder_text = "Напоминание"
         return (reminder_text, run_at), None
 
-    return None, "❌ Не смог распознать время. Скажи, например: в 13 купить хлеб или напомни в 15:00 купить хлеб"
+    return None, "❌ Не смог распознать время."
 
 def ensure_vosk_model():
     if os.path.isdir(VOSK_MODEL_PATH):
@@ -560,33 +671,50 @@ def get_vosk_model():
     return VOSK_MODEL
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = build_status_text(update.effective_chat.id)
-    await update_status_message(update, context, text, include_keyboard=True)
+    chat_id = update.effective_chat.id
+    if not is_intro_sent(chat_id):
+        await update.message.reply_text(
+            "👋 Привет! Я бот-напоминалка.\nПиши текстом или голосом.",
+            reply_markup=keyboard(),
+        )
+        set_intro_sent(chat_id)
+        return
+    await update.message.reply_text("✅ Я на связи.", reply_markup=keyboard())
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, reply_markup=keyboard())
 
 async def show_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = build_status_text(update.effective_chat.id)
-    await update_status_message(update, context, text)
+    items = list_reminders(update.effective_chat.id, limit=10)
+    if not items:
+        await update.message.reply_text("Сейчас нет активных напоминаний.", reply_markup=keyboard())
+        return
+    lines = ["Ближайшие напоминания:"]
+    for _id, text, run_at in items:
+        lines.append(f"• {format_run_at(run_at)} — {text}")
+    await update.message.reply_text("\n".join(lines), reply_markup=keyboard())
 
 async def delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard_markup = build_delete_keyboard(update.effective_chat.id)
-    if not keyboard_markup:
-        text = build_status_text(update.effective_chat.id, notice="Нет активных напоминаний для удаления.")
-        await update_status_message(update, context, text)
+    items = list_reminders(update.effective_chat.id, limit=10)
+    if not items:
+        await update.message.reply_text("Нет активных напоминаний для удаления.", reply_markup=keyboard())
         return
-    await update_status_message(
-        update,
-        context,
+    buttons = []
+    for _id, text, run_at in items:
+        label = f"{format_run_at(run_at)} — {text[:30]}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"del:{_id}")])
+    buttons.append([InlineKeyboardButton("Отмена", callback_data="del:cancel")])
+    await update.message.reply_text(
         "Выбери напоминание для удаления:",
-        inline_keyboard=keyboard_markup,
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
-async def on_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data or ""
     if data == "del:cancel":
-        text = build_status_text(update.effective_chat.id, notice="Удаление отменено.")
-        await update_status_message(update, context, text)
+        await query.edit_message_text("Удаление отменено.")
         return
     if data.startswith("del:"):
         reminder_id = int(data.split(":", 1)[1])
@@ -594,8 +722,39 @@ async def on_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if task:
             task.cancel()
         delete_reminder(reminder_id)
-        text = build_status_text(update.effective_chat.id, notice="✅ Напоминание удалено.")
-        await update_status_message(update, context, text)
+        await query.edit_message_text("✅ Напоминание удалено.")
+        return
+    if data.startswith("ack:"):
+        reminder_id = int(data.split(":", 1)[1])
+        task = TASKS.pop(reminder_id, None)
+        if task:
+            task.cancel()
+        delete_reminder(reminder_id)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if data.startswith("confirm_yes:"):
+        reminder_id = int(data.split(":", 1)[1])
+        task = TASKS.pop(reminder_id, None)
+        if task:
+            task.cancel()
+        delete_reminder(reminder_id)
+        await query.edit_message_text("✅ Принято.")
+        return
+    if data.startswith("confirm_no:"):
+        reminder_id = int(data.split(":", 1)[1])
+        update_reminder_state(
+            reminder_id,
+            attempts=0,
+            awaiting_confirm=False,
+            acknowledged=False,
+            run_at=int(datetime.now(timezone.utc).timestamp()) + REPEAT_INTERVAL_SEC,
+        )
+        schedule_reminder(context.application, reminder_id)
+        await query.edit_message_text("⏰ Ок, напомню еще раз через 2 минуты.")
+        return
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -629,37 +788,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = json.loads(rec.FinalResult())
         text = (result.get("text") or "").strip()
         if not text:
-            text_out = build_status_text(
-                update.effective_chat.id,
-                notice="❌ Не удалось распознать голос. Попробуй еще раз.",
-            )
-            await update_status_message(update, context, text_out)
+            await update.message.reply_text("❌ Не удалось распознать голос.", reply_markup=keyboard())
             return
 
         parsed, error = parse_time_from_text(text)
         if error:
-            text_out = build_status_text(
-                update.effective_chat.id,
-                notice=f"{error}\nЯ услышал: \"{text}\"",
-            )
-            await update_status_message(update, context, text_out)
+            await update.message.reply_text(f"{error}\nЯ услышал: \"{text}\"", reply_markup=keyboard())
             return
 
         reminder_text, run_at = parsed
         reminder_id = add_reminder(update.effective_chat.id, reminder_text, run_at)
-        schedule_reminder(context.application, reminder_id, update.effective_chat.id, reminder_text, run_at)
-        text_out = build_status_text(
-            update.effective_chat.id,
-            notice=f'⏰ Напомню в {format_run_at(run_at)}: "{reminder_text}"',
+        schedule_reminder(context.application, reminder_id)
+        await update.message.reply_text(
+            f"⏰ {format_run_at(run_at)} — {reminder_text}",
+            reply_markup=keyboard(),
         )
-        await update_status_message(update, context, text_out)
     except Exception as e:
         logging.exception("Ошибка обработки голосового сообщения: %s", e)
-        text_out = build_status_text(
-            update.effective_chat.id,
-            notice="❌ Ошибка при обработке голосового. Проверь, что в Railway задано APT_PACKAGES=ffmpeg.",
-        )
-        await update_status_message(update, context, text_out)
+        await update.message.reply_text("❌ Ошибка при обработке голосового.", reply_markup=keyboard())
     finally:
         try:
             if 'ogg_path' in locals() and os.path.exists(ogg_path):
@@ -678,36 +824,32 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == BTN_DELETE:
             await delete_menu(update, context)
             return
+        if text == BTN_HELP:
+            await help_command(update, context)
+            return
 
         parsed, error = parse_time_from_text(text)
         if parsed:
             reminder_text, run_at = parsed
             reminder_id = add_reminder(update.effective_chat.id, reminder_text, run_at)
-            schedule_reminder(context.application, reminder_id, update.effective_chat.id, reminder_text, run_at)
-            text_out = build_status_text(
-                update.effective_chat.id,
-                notice=f'⏰ Напомню в {format_run_at(run_at)}: "{reminder_text}"',
+            schedule_reminder(context.application, reminder_id)
+            await update.message.reply_text(
+                f"⏰ {format_run_at(run_at)} — {reminder_text}",
+                reply_markup=keyboard(),
             )
-            await update_status_message(update, context, text_out)
             return
 
-        text_out = build_status_text(update.effective_chat.id, notice=error)
-        await update_status_message(update, context, text_out)
+        await update.message.reply_text(error, reply_markup=keyboard())
         return
 
     except ValueError:
-        text_out = build_status_text(
-            update.effective_chat.id,
-            notice="❌ Неверный формат. Пример: В 13 купить хлеб или напомни в 15:00 купить хлеб",
-        )
-        await update_status_message(update, context, text_out)
+        await update.message.reply_text("❌ Неверный формат.", reply_markup=keyboard())
     except Exception as e:
-        text_out = build_status_text(update.effective_chat.id, notice=f"❌ Ошибка: {str(e)}")
-        await update_status_message(update, context, text_out)
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}", reply_markup=keyboard())
 
 async def on_startup(app: Application):
-    for reminder_id, chat_id, text, run_at in load_pending_reminders():
-        schedule_reminder(app, reminder_id, chat_id, text, run_at)
+    for (reminder_id,) in load_pending_reminders():
+        schedule_reminder(app, reminder_id)
 
 def main():
     token = os.getenv('BOT_TOKEN')
@@ -720,9 +862,10 @@ def main():
     app = Application.builder().token(token).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(CallbackQueryHandler(on_delete_callback))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     print("Бот запущен...")
     app.run_polling()
