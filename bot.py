@@ -123,7 +123,7 @@ def parse_time_from_text(text: str):
         ).strip(" ,.-")
 
         if not reminder_text:
-            return None, "❌ Не понял текст напоминания. Пример: напомни в 15:00 купить хлеб"
+            reminder_text = "Напоминание"
 
         run_at = int(target.astimezone(timezone.utc).timestamp())
         return (reminder_text, run_at), None
@@ -142,7 +142,7 @@ def parse_time_from_text(text: str):
             flags=re.IGNORECASE,
         ).strip(" ,.-")
         if not reminder_text:
-            return None, "❌ Не понял текст напоминания. Пример: напомни через 15 минут купить хлеб"
+            reminder_text = "Напоминание"
         return (reminder_text, run_at), None
 
     return None, "❌ Не смог распознать время. Скажи, например: напомни в 15:00 купить хлеб"
@@ -168,9 +168,9 @@ def get_vosk_model():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '👋 Привет! Я бот-напоминалка.\n\n'
-        'Отправь мне сообщение в формате:\n'
-        '<текст напоминания> | <минуты>\n\n'
-        'Например: Выключить плиту | 15'
+        'Напиши сообщение в свободной форме, например:\n'
+        'Напомни в 15:00 купить хлеб\n'
+        'или: Напомни через 15 минут выключить плиту'
         , reply_markup=keyboard()
     )
 
@@ -260,7 +260,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logging.exception("Ошибка обработки голосового сообщения: %s", e)
-        await update.message.reply_text("❌ Ошибка при обработке голосового.", reply_markup=keyboard())
+        await update.message.reply_text(
+            "❌ Ошибка при обработке голосового. Проверь, что в Railway задано APT_PACKAGES=ffmpeg.",
+            reply_markup=keyboard(),
+        )
     finally:
         try:
             if 'ogg_path' in locals() and os.path.exists(ogg_path):
@@ -280,27 +283,27 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await delete_menu(update, context)
             return
 
-        if '|' not in text:
-            await update.message.reply_text('❌ Используй формат: текст | минуты\nНапример: Позвонить маме | 30')
+        parsed, error = parse_time_from_text(text)
+        if parsed:
+            reminder_text, run_at = parsed
+            reminder_id = add_reminder(update.effective_chat.id, reminder_text, run_at)
+            await update.message.reply_text(
+                f'⏰ Напомню в {format_run_at(run_at)}: "{reminder_text}"',
+                reply_markup=keyboard()
+            )
+            schedule_reminder(context.application, reminder_id, update.effective_chat.id, reminder_text, run_at)
             return
 
-        reminder_text, minutes_str = text.split('|', 1)
-        reminder_text = reminder_text.strip()
-        minutes = int(minutes_str.strip())
-
-        if minutes <= 0:
-            await update.message.reply_text('❌ Количество минут должно быть больше 0')
-            return
-
-        run_at = int(datetime.now(timezone.utc).timestamp()) + minutes * 60
-        reminder_id = add_reminder(update.effective_chat.id, reminder_text, run_at)
-
-        await update.message.reply_text(f'⏰ Напомню через {minutes} мин: "{reminder_text}"', reply_markup=keyboard())
-
-        schedule_reminder(context.application, reminder_id, update.effective_chat.id, reminder_text, run_at)
+        await update.message.reply_text(
+            '❌ Напиши так:\n'
+            'Напомни в 15:00 купить хлеб\n'
+            'или: Напомни через 15 минут выключить плиту',
+            reply_markup=keyboard()
+        )
+        return
 
     except ValueError:
-        await update.message.reply_text('❌ Неверный формат. Пример: Выключить духовку | 20')
+        await update.message.reply_text('❌ Неверный формат. Пример: Напомни в 15:00 купить хлеб')
     except Exception as e:
         await update.message.reply_text(f'❌ Ошибка: {str(e)}')
 
