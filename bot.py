@@ -103,6 +103,7 @@ async def reminder_task(app: Application, reminder_id: int, chat_id: int, text: 
 def parse_time_from_text(text: str):
     lower = text.lower()
     lower = lower.replace("ё", "е")
+    tokens = re.findall(r"[a-zа-я]+|\d+", lower)
     time_match = re.search(r"\b(\d{1,2})[:.](\d{2})\b", lower)
     if time_match:
         hour = int(time_match.group(1))
@@ -165,6 +166,8 @@ def parse_time_from_text(text: str):
             return None, idx
 
         token = tokens[idx]
+        if token.isdigit():
+            return int(token), idx + 1
         if token in teens:
             return teens[token], idx + 1
         if token in tens:
@@ -178,27 +181,27 @@ def parse_time_from_text(text: str):
         return None, idx
 
     def parse_spoken_time(text_value: str):
-        tokens = re.findall(r"[a-zа-я]+", text_value)
-        tokens = [t.replace("ё", "е") for t in tokens]
+        tokens_local = re.findall(r"[a-zа-я]+", text_value)
+        tokens_local = [t.replace("ё", "е") for t in tokens_local]
 
-        if "полдень" in tokens:
+        if "полдень" in tokens_local:
             return 12, 0
-        if "полночь" in tokens:
+        if "полночь" in tokens_local:
             return 0, 0
 
-        for i, tok in enumerate(tokens):
+        for i, tok in enumerate(tokens_local):
             if tok not in ("в", "во"):
                 continue
-            hour, j = parse_number(tokens, i + 1)
+            hour, j = parse_number(tokens_local, i + 1)
             if hour is None:
                 continue
 
-            if j < len(tokens) and tokens[j] in ("час", "часа", "часов"):
+            if j < len(tokens_local) and tokens_local[j] in ("час", "часа", "часов"):
                 j += 1
 
             minute = None
-            if j < len(tokens):
-                minute, j2 = parse_number(tokens, j)
+            if j < len(tokens_local):
+                minute, j2 = parse_number(tokens_local, j)
                 if minute is not None:
                     j = j2
 
@@ -242,6 +245,37 @@ def parse_time_from_text(text: str):
 
         run_at = int(target.astimezone(timezone.utc).timestamp())
         return (reminder_text, run_at), None
+
+    if "через" in tokens:
+        try:
+            idx = tokens.index("через")
+            minutes_val, _ = parse_number(tokens, idx + 1)
+        except ValueError:
+            minutes_val = None
+        if minutes_val is not None:
+            minutes = minutes_val
+            if minutes <= 0:
+                return None, "❌ Количество минут должно быть больше 0"
+            run_at = int(datetime.now(timezone.utc).timestamp()) + minutes * 60
+            reminder_text = re.sub(r"\bчерез\b", "", text, flags=re.IGNORECASE)
+            reminder_text = re.sub(r"\bмин(ут|уты|уту)?\b", "", reminder_text, flags=re.IGNORECASE)
+            reminder_text = re.sub(
+                r"\b(ноль|один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|"
+                r"одиннадцать|двенадцать|тринадцать|четырнадцать|пятнадцать|шестнадцать|"
+                r"семнадцать|восемнадцать|девятнадцать|двадцать|тридцать|сорок|пятьдесят)\b",
+                "",
+                reminder_text,
+                flags=re.IGNORECASE,
+            ).strip(" ,.-")
+            reminder_text = re.sub(
+                r"\b(сделай|сделали|поставь|создай|напомни|напоминание|мне|пожалуйста)\b",
+                "",
+                reminder_text,
+                flags=re.IGNORECASE,
+            ).strip(" ,.-")
+            if not reminder_text:
+                reminder_text = "Напоминание"
+            return (reminder_text, run_at), None
 
     minutes_match = re.search(r"\bчерез\s+(\d{1,4})\s*мин", lower)
     if minutes_match:
