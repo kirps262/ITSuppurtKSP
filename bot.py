@@ -8,6 +8,8 @@ import urllib.request
 import subprocess
 from datetime import datetime, timedelta, timezone
 import sqlite3
+import psycopg2
+import psycopg2.extras
 import asyncio
 from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -16,6 +18,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 logging.basicConfig(level=logging.INFO)
 
 DB_PATH = os.getenv("REMINDERS_DB", "reminders.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 BTN_LIST = "📋 Мои напоминания"
@@ -29,51 +32,112 @@ VOSK_MODEL_URL = os.getenv(
     "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
 )
 
+def get_conn():
+    if DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect(DB_PATH)
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                run_at INTEGER NOT NULL
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if DATABASE_URL:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    text TEXT NOT NULL,
+                    run_at BIGINT NOT NULL
+                )
+                """
             )
-            """
-        )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    run_at INTEGER NOT NULL
+                )
+                """
+            )
         conn.commit()
+    finally:
+        conn.close()
 
 def add_reminder(chat_id: int, text: str, run_at: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "INSERT INTO reminders (chat_id, text, run_at) VALUES (?, ?, ?)",
-            (chat_id, text, run_at),
-        )
+    conn = get_conn()
+    try:
+        if DATABASE_URL:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO reminders (chat_id, text, run_at) VALUES (%s, %s, %s) RETURNING id",
+                (chat_id, text, run_at),
+            )
+            reminder_id = cur.fetchone()[0]
+        else:
+            cur = conn.execute(
+                "INSERT INTO reminders (chat_id, text, run_at) VALUES (?, ?, ?)",
+                (chat_id, text, run_at),
+            )
+            reminder_id = cur.lastrowid
         conn.commit()
-        return cur.lastrowid
+        return reminder_id
+    finally:
+        conn.close()
 
 def delete_reminder(reminder_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+    conn = get_conn()
+    try:
+        if DATABASE_URL:
+            conn.cursor().execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+        else:
+            conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
         conn.commit()
+    finally:
+        conn.close()
 
 def list_reminders(chat_id: int, limit: int = 10):
     now_ts = int(datetime.now(timezone.utc).timestamp())
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "SELECT id, text, run_at FROM reminders WHERE chat_id = ? AND run_at >= ? ORDER BY run_at ASC LIMIT ?",
-            (chat_id, now_ts, limit),
-        )
-        return cur.fetchall()
+    conn = get_conn()
+    try:
+        if DATABASE_URL:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, text, run_at FROM reminders WHERE chat_id = %s AND run_at >= %s ORDER BY run_at ASC LIMIT %s",
+                (chat_id, now_ts, limit),
+            )
+            return cur.fetchall()
+        else:
+            cur = conn.execute(
+                "SELECT id, text, run_at FROM reminders WHERE chat_id = ? AND run_at >= ? ORDER BY run_at ASC LIMIT ?",
+                (chat_id, now_ts, limit),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
 
 def load_pending_reminders():
     now_ts = int(datetime.now(timezone.utc).timestamp())
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "SELECT id, chat_id, text, run_at FROM reminders WHERE run_at >= ?",
-            (now_ts,),
-        )
-        return cur.fetchall()
+    conn = get_conn()
+    try:
+        if DATABASE_URL:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, chat_id, text, run_at FROM reminders WHERE run_at >= %s",
+                (now_ts,),
+            )
+            return cur.fetchall()
+        else:
+            cur = conn.execute(
+                "SELECT id, chat_id, text, run_at FROM reminders WHERE run_at >= ?",
+                (now_ts,),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
 
 def keyboard():
     return ReplyKeyboardMarkup([[BTN_LIST, BTN_DELETE]], resize_keyboard=True)
