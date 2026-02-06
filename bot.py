@@ -83,7 +83,7 @@ def format_run_at(ts: int) -> str:
     return dt.strftime("%d.%m %H:%M")
 
 def schedule_reminder(app: Application, reminder_id: int, chat_id: int, text: str, run_at: int):
-    task = asyncio.create_task(reminder_task(app, reminder_id, chat_id, text, run_at))
+    task = app.create_task(reminder_task(app, reminder_id, chat_id, text, run_at))
     TASKS[reminder_id] = task
 
 async def reminder_task(app: Application, reminder_id: int, chat_id: int, text: str, run_at: int):
@@ -307,6 +307,10 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f'❌ Ошибка: {str(e)}')
 
+async def on_startup(app: Application):
+    for reminder_id, chat_id, text, run_at in load_pending_reminders():
+        schedule_reminder(app, reminder_id, chat_id, text, run_at)
+
 def main():
     token = os.getenv('BOT_TOKEN')
     if not token:
@@ -315,7 +319,7 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder))
@@ -323,8 +327,6 @@ def main():
     app.add_handler(CallbackQueryHandler(on_delete_callback))
 
     print("Бот запущен...")
-    for reminder_id, chat_id, text, run_at in load_pending_reminders():
-        schedule_reminder(app, reminder_id, chat_id, text, run_at)
     app.run_polling()
 
 if __name__ == '__main__':
