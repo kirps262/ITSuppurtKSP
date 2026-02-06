@@ -248,7 +248,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         parsed, error = parse_time_from_text(text)
         if error:
-            await update.message.reply_text(error, reply_markup=keyboard())
+            await update.message.reply_text(f"{error}\nЯ услышал: \"{text}\"", reply_markup=keyboard())
             return
 
         reminder_text, run_at = parsed
