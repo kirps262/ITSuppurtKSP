@@ -102,6 +102,7 @@ async def reminder_task(app: Application, reminder_id: int, chat_id: int, text: 
 
 def parse_time_from_text(text: str):
     lower = text.lower()
+    lower = lower.replace("ё", "е")
     time_match = re.search(r"\b(\d{1,2})[:.](\d{2})\b", lower)
     if time_match:
         hour = int(time_match.group(1))
@@ -115,6 +116,120 @@ def parse_time_from_text(text: str):
             target = target + timedelta(days=1)
 
         reminder_text = re.sub(r"\b(\d{1,2})[:.](\d{2})\b", "", text).strip()
+        reminder_text = re.sub(
+            r"\b(сделай|поставь|создай|напомни|напоминание|на|в|мне|пожалуйста)\b",
+            "",
+            reminder_text,
+            flags=re.IGNORECASE,
+        ).strip(" ,.-")
+
+        if not reminder_text:
+            reminder_text = "Напоминание"
+
+        run_at = int(target.astimezone(timezone.utc).timestamp())
+        return (reminder_text, run_at), None
+
+    def parse_number(tokens, idx):
+        units = {
+            "ноль": 0,
+            "один": 1, "одна": 1,
+            "два": 2, "две": 2,
+            "три": 3,
+            "четыре": 4,
+            "пять": 5,
+            "шесть": 6,
+            "семь": 7,
+            "восемь": 8,
+            "девять": 9,
+        }
+        teens = {
+            "десять": 10,
+            "одиннадцать": 11,
+            "двенадцать": 12,
+            "тринадцать": 13,
+            "четырнадцать": 14,
+            "пятнадцать": 15,
+            "шестнадцать": 16,
+            "семнадцать": 17,
+            "восемнадцать": 18,
+            "девятнадцать": 19,
+        }
+        tens = {
+            "двадцать": 20,
+            "тридцать": 30,
+            "сорок": 40,
+            "пятьдесят": 50,
+        }
+
+        if idx >= len(tokens):
+            return None, idx
+
+        token = tokens[idx]
+        if token in teens:
+            return teens[token], idx + 1
+        if token in tens:
+            value = tens[token]
+            if idx + 1 < len(tokens) and tokens[idx + 1] in units:
+                value += units[tokens[idx + 1]]
+                return value, idx + 2
+            return value, idx + 1
+        if token in units:
+            return units[token], idx + 1
+        return None, idx
+
+    def parse_spoken_time(text_value: str):
+        tokens = re.findall(r"[a-zа-я]+", text_value)
+        tokens = [t.replace("ё", "е") for t in tokens]
+
+        if "полдень" in tokens:
+            return 12, 0
+        if "полночь" in tokens:
+            return 0, 0
+
+        for i, tok in enumerate(tokens):
+            if tok not in ("в", "во"):
+                continue
+            hour, j = parse_number(tokens, i + 1)
+            if hour is None:
+                continue
+
+            if j < len(tokens) and tokens[j] in ("час", "часа", "часов"):
+                j += 1
+
+            minute = None
+            if j < len(tokens):
+                minute, j2 = parse_number(tokens, j)
+                if minute is not None:
+                    j = j2
+
+            if minute is None:
+                minute = 0
+
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour, minute
+
+        return None
+
+    spoken_time = parse_spoken_time(lower)
+    if spoken_time:
+        hour, minute = spoken_time
+        now = datetime.now(MOSCOW_TZ)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+
+        reminder_text = text
+        time_words = [
+            "в", "во", "час", "часа", "часов", "полдень", "полночь",
+            "ноль", "один", "одна", "два", "две", "три", "четыре", "пять",
+            "шесть", "семь", "восемь", "девять", "десять", "одиннадцать",
+            "двенадцать", "тринадцать", "четырнадцать", "пятнадцать",
+            "шестнадцать", "семнадцать", "восемнадцать", "девятнадцать",
+            "двадцать", "тридцать", "сорок", "пятьдесят",
+        ]
+        for w in time_words:
+            reminder_text = re.sub(rf"\b{w}\b", " ", reminder_text, flags=re.IGNORECASE)
+        reminder_text = re.sub(r"\s{2,}", " ", reminder_text).strip()
         reminder_text = re.sub(
             r"\b(сделай|поставь|создай|напомни|напоминание|на|в|мне|пожалуйста)\b",
             "",
