@@ -323,6 +323,7 @@ def parse_time_from_text(text: str):
             run_at = int(datetime.now(timezone.utc).timestamp()) + minutes * 60
             reminder_text = re.sub(r"\bчерез\b", "", text, flags=re.IGNORECASE)
             reminder_text = re.sub(r"\bмин(ут|уты|уту)?\b", "", reminder_text, flags=re.IGNORECASE)
+            reminder_text = re.sub(r"\b\d+\b", "", reminder_text)
             reminder_text = re.sub(
                 r"\b(ноль|один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|"
                 r"одиннадцать|двенадцать|тринадцать|четырнадцать|пятнадцать|шестнадцать|"
